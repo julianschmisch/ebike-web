@@ -1,8 +1,17 @@
-# eBike App (Web, für Bluefy)
+# eBike App für Bluefy (Web Bluetooth), abgespeckt
 
-Eine kleine Web-App, die sich per Web Bluetooth mit einem Tsinova-eBike verbindet
-(Geschwindigkeit, Akku, Fahrstufe, Tages- und Gesamtkilometer, Reichweite,
-Akkuwarnung, Parkplatz). Gedacht für den iPhone-Browser **Bluefy**.
+Kleine Webseite für den Browser **Bluefy** auf dem iPhone. Kein Signieren, keine 7-Tage-Erneuerung.
 
-Es gibt kein Benutzerkonto und keinen Server. Alle Daten bleiben im Browser des Handys.
-Inoffizielles Hobbyprojekt, nicht von Tsinova.
+Sie kann nur zwei Dinge: die **Fahrstufe wählen** (N, Eco, Normal, Sport) und den **Akkustand anzeigen**
+(Balken grün über 50 %, orange bis 21 %, rot bei 20 % und darunter).
+Kilometerzähler, Fahrzeit, Reichweite, Parkplatz und Akkuwarnung gibt es hier nicht, weil die Seite im Hintergrund
+nicht laufen kann (iOS hält sie an, sobald der Bildschirm ausgeht oder Bluefy nicht vorne ist).
+
+- Öffnen: die Adresse der Seite in Bluefy aufrufen, dann "Rad suchen".
+- Es wird nichts gespeichert außer der gewählten Sprache. Gesendet wird nur die Fahrstufe, die man antippt.
+
+## Dateien
+- `index.html`, `style.css`, `app.js` – Oberfläche und Bluetooth
+- `core.js`, `des.js` – Protokoll und Verschlüsselung (aus der Dart-App übernommen)
+- `test/core.test.mjs` – Tests gegen dieselben Testwerte wie die Android-App (`node --test test/core.test.mjs`)
+- `test/e2e.mjs` – Browser-Test mit nachgebautem Rad (braucht Playwright)

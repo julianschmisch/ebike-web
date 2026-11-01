@@ -1,10 +1,10 @@
-// eBike App für den Browser (Bluefy auf dem iPhone). Spricht per Web Bluetooth
-// mit dem Rad. Die Logik steckt in core.js, hier sind Bluetooth und Bildschirm.
+// eBike App für den Browser (Bluefy auf dem iPhone), abgespeckt: nur Fahrstufe
+// wählen und Akkustand sehen. Die Seite kann im Hintergrund nicht laufen, darum
+// gibt es hier keine Zähler. Die Logik steckt in core.js.
 
 import {
-  desFromKeyText, keyFromBluetoothName, maskedBikeName, FrameAssembler, FrameKind,
+  desFromKeyText, keyFromBluetoothName, FrameAssembler, FrameKind,
   gearSymbol, buildGearCommand, encryptCommand, splitForBle, PAD_ORDER, isSafeCommandValue,
-  TripMeter, formatDuration, RangeEstimator, GearConsumption, BatteryAlert, distanceMeters,
 } from './core.js';
 
 const SERVICE = '0000ff00-0000-1000-8000-00805f9b34fb';
@@ -58,28 +58,11 @@ const state = {
   message: null,
   data: null,
   bikeName: '',
-  displayName: store.get('bike_name') || '',
   pendingGear: null,
   reconnecting: false,
   lockOn: false,
-  locationOk: null,
-  parking: loadJson('parking'),
-  last: loadJson('last'),
   log: [],
 };
-
-const trip = new TripMeter();
-trip.restore(store.num('trip_km'), store.num('trip_ms'));
-const total = new TripMeter();
-total.restore(store.num('total_km'), 0);
-const odometer = new TripMeter();
-const gearStats = new GearConsumption();
-gearStats.restore(store.get('gear_stats'));
-const batteryAlert = new BatteryAlert();
-batteryAlert.armed = store.get('alert_armed') !== '0';
-let storedRate = store.get('pct_per_km') === null ? null : store.num('pct_per_km');
-let range = new RangeEstimator(storedRate);
-let rangeKm = null;
 
 let device = null;
 let server = null;
@@ -90,25 +73,11 @@ let des = null;
 let watchdog = null;
 let userDisconnect = false;
 let reconnectTimer = null;
-let lastOdo = 0;
-let batteryChecked = false;
-let lastFix = null;
-let fixBusy = false;
 let workingPad = null;
 let gearWaiter = null;
 let gearTarget = null;
 let wakeLock = null;
-let lastSave = 0;
 let logOpen = false;
-
-function loadJson(key) {
-  try {
-    const t = store.get(key);
-    return t ? JSON.parse(t) : null;
-  } catch (_) {
-    return null;
-  }
-}
 
 function log(text) {
   const t = new Date().toLocaleTimeString();
@@ -174,7 +143,6 @@ async function attach(dev) {
   dev.addEventListener('gattserverdisconnected', onGattDisconnected);
   state.link = 'connecting';
   state.data = null;
-  batteryChecked = false;
   scheduleRender();
   try {
     await setupGatt(dev);
@@ -229,11 +197,6 @@ function onGattDisconnected() {
   }
   if (state.link !== 'connected') return;
   log('Verbindung zum Rad verloren.');
-  captureParking();
-  saveAll();
-  total.breakLink();
-  trip.breakLink();
-  odometer.breakLink();
   state.data = null;
   state.link = 'idle';
   state.message = tr('Die Verbindung zum Rad wurde getrennt.', 'The connection to the bike was lost.');
@@ -278,9 +241,6 @@ async function disconnect() {
   state.reconnecting = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
   if (watchdog) clearTimeout(watchdog);
-  const wasConnected = state.link === 'connected';
-  if (wasConnected) captureParking();
-  saveAll();
   try {
     device?.gatt?.disconnect();
   } catch (_) {
@@ -347,172 +307,17 @@ let lastLoggedText = null;
 
 function onFrame(result) {
   garbageInRow = 0;
-  const d = result.data;
-  state.data = d;
+  state.data = result.data;
   state.message = null;
-  const now = Date.now();
-  const speed = d.speedKmh;
-  if (speed !== null) {
-    trip.addSample(speed, now);
-    total.addSample(speed, now);
-    odometer.addSample(speed, now);
-  }
-  const odo = odometer.distanceKm;
-  const deltaKm = odo - lastOdo;
-  lastOdo = odo;
-  const battery = d.battery;
-  if (battery !== null) {
-    if (!batteryChecked) {
-      batteryChecked = true;
-      const lb = state.last?.battery;
-      if (typeof lb === 'number' && battery - lb >= GearConsumption.chargeRise) gearStats.markCharged();
-    }
-    gearStats.addSample({ gear: d.gear, battery, deltaKm });
-    checkBatteryAlert(battery);
-    range.addSample(odo, battery);
-    const r = range.rangeKm(battery);
-    if (r === null) rangeKm = null;
-    else rangeKm = rangeKm === null ? r : rangeKm * 0.85 + r * 0.15;
-  }
-  state.last = {
-    battery: battery ?? state.last?.battery ?? null,
-    gear: d.gear ?? state.last?.gear ?? null,
-    at: now,
-  };
-  saveIfDue(now);
-  maybeLocate(now, speed);
   if (result.text !== lastLoggedText) {
     lastLoggedText = result.text;
     log('Entschlüsselt: ' + result.text);
   }
-  if (gearTarget !== null && d.gear === gearTarget && gearWaiter) {
+  if (gearTarget !== null && result.data.gear === gearTarget && gearWaiter) {
     gearWaiter();
   }
   armWatchdog();
   scheduleRender();
-}
-
-// ------------------------------------------------------------ Speichern
-
-function saveAll() {
-  store.set('trip_km', trip.distanceKm);
-  store.set('trip_ms', trip.movingMs);
-  store.set('total_km', total.distanceKm);
-  store.set('gear_stats', gearStats.encode());
-  store.set('alert_armed', batteryAlert.armed ? '1' : '0');
-  if (state.last) store.set('last', JSON.stringify(state.last));
-  const learned = range.learnedPctPerKm;
-  if (learned !== null) {
-    storedRate = storedRate === null ? learned : storedRate * 0.7 + learned * 0.3;
-    store.set('pct_per_km', storedRate);
-  }
-}
-
-function saveIfDue(now) {
-  if (now - lastSave < 5000) return;
-  lastSave = now;
-  saveAll();
-}
-
-// ------------------------------------------------------------ Akkuwarnung
-
-function checkBatteryAlert(battery) {
-  const before = batteryAlert.armed;
-  if (batteryAlert.update(battery)) {
-    log(`Akkuwarnung ausgelöst bei ${battery} %.`);
-    beep();
-    try {
-      navigator.vibrate?.([300, 150, 300]);
-    } catch (_) {
-      // nicht überall möglich
-    }
-  }
-  if (batteryAlert.armed !== before) store.set('alert_armed', batteryAlert.armed ? '1' : '0');
-}
-
-let audioCtx = null;
-function unlockAudio() {
-  try {
-    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-  } catch (_) {
-    // kein Ton möglich
-  }
-}
-
-function beep() {
-  try {
-    if (!audioCtx) return;
-    for (let i = 0; i < 3; i++) {
-      const o = audioCtx.createOscillator();
-      const g = audioCtx.createGain();
-      o.frequency.value = 880;
-      g.gain.value = 0.2;
-      o.connect(g);
-      g.connect(audioCtx.destination);
-      o.start(audioCtx.currentTime + i * 0.35);
-      o.stop(audioCtx.currentTime + i * 0.35 + 0.2);
-    }
-  } catch (_) {
-    // kein Ton möglich
-  }
-}
-
-// ------------------------------------------------------------ Parkplatz
-
-function getFix() {
-  return new Promise((resolve) => {
-    if (!navigator.geolocation) {
-      state.locationOk = false;
-      resolve(null);
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      (p) => {
-        state.locationOk = true;
-        resolve({ lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, at: Date.now() });
-      },
-      (err) => {
-        if (err && err.code === 1) state.locationOk = false;
-        resolve(null);
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 },
-    );
-  });
-}
-
-function maybeLocate(now, speed) {
-  if (fixBusy || state.locationOk === false) return;
-  const stale = !lastFix || now - lastFix.at >= 60000;
-  if (!stale) return;
-  if (!((speed ?? 0) > 3) && lastFix) return;
-  fixBusy = true;
-  getFix()
-    .then((fix) => {
-      if (fix) lastFix = fix;
-      scheduleRender();
-    })
-    .finally(() => {
-      fixBusy = false;
-    });
-}
-
-async function captureParking() {
-  if (state.locationOk !== true) return;
-  const base = lastFix;
-  if (base && Date.now() - base.at < 15 * 60000) {
-    state.parking = base;
-    store.set('parking', JSON.stringify(base));
-    scheduleRender();
-  }
-  const fresh = await getFix();
-  if (!fresh) return;
-  if (!base || distanceMeters(base.lat, base.lon, fresh.lat, fresh.lon) < 150) {
-    state.parking = fresh;
-    lastFix = fresh;
-    store.set('parking', JSON.stringify(fresh));
-    scheduleRender();
-  }
 }
 
 // ------------------------------------------------------------ Bildschirm anlassen
@@ -545,9 +350,7 @@ function releaseWakeLock() {
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.link === 'connected') requestWakeLock();
-  if (document.visibilityState === 'hidden') saveAll();
 });
-window.addEventListener('pagehide', saveAll);
 
 // ------------------------------------------------------------ Fahrstufe
 
@@ -634,25 +437,6 @@ async function setGear(gear) {
 
 const $app = document.getElementById('app');
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const GEAR_NAMES = { 1: 'Eco', 2: 'Normal', 3: 'Sport' };
-const bikeTitle = () => state.displayName.trim() || tr('Mein Tsinova-Rad', 'My Tsinova bike');
-const fmtKm = (km) => localNum(km >= 1000 ? km.toFixed(0) : km.toFixed(1)) + ' km';
-const approx = (km) => `${tr('ca.', 'approx.')} ${Math.round(km)} km`;
-
-function stamp(ms) {
-  const at = new Date(ms);
-  const two = (n) => String(n).padStart(2, '0');
-  const today = new Date();
-  const dayDiff = Math.round(
-    (new Date(today.getFullYear(), today.getMonth(), today.getDate()) -
-      new Date(at.getFullYear(), at.getMonth(), at.getDate())) / 86400000,
-  );
-  const time = `${two(at.getHours())}:${two(at.getMinutes())}${english ? '' : ' Uhr'}`;
-  if (dayDiff === 0) return tr('heute, ', 'today, ') + time;
-  if (dayDiff === 1) return tr('gestern, ', 'yesterday, ') + time;
-  return `${two(at.getDate())}.${two(at.getMonth() + 1)}.${at.getFullYear()}, ${time}`;
-}
-
 function pill() {
   const map = {
     idle: [state.reconnecting ? tr('Suche läuft …', 'Searching …') : tr('Nicht verbunden', 'Not connected'), '#8a8a8e'],
@@ -662,46 +446,6 @@ function pill() {
   };
   const [text, color] = map[state.link];
   return `<div class="center"><span class="pill" style="color:${color}">${esc(text)}</span></div>`;
-}
-
-function gearRangeList(battery, currentGear) {
-  if (typeof battery !== 'number') return '';
-  const rows = GearConsumption.gears
-    .map((g) => {
-      const r = gearStats.rangeKm(g, battery);
-      const value = r !== null
-        ? approx(r)
-        : `${tr('lernt noch', 'still learning')} (${localNum(gearStats.learnedKm(g).toFixed(1))} km)`;
-      return `<div class="grow${currentGear === g ? ' cur' : ''}"><span>${GEAR_NAMES[g]}</span><b class="${r === null ? 'dim' : ''}">${esc(value)}</b></div>`;
-    })
-    .join('');
-  return `<div class="small">${esc(tr('Reichweite je Fahrstufe', 'Range per assist level'))}</div>${rows}`;
-}
-
-function lastCard() {
-  const l = state.last;
-  if (!l) return '';
-  return `<div class="card">
-    <b>${esc(tr('Letzter Stand', 'Last status'))}</b>
-    <div class="faint">${esc(stamp(l.at))}</div>
-    <div class="row"><span>${esc(tr('Akku', 'Battery'))}</span><b>${l.battery === null ? '–' : l.battery + ' %'}</b></div>
-    <div class="row"><span>${esc(tr('Tageskilometer', 'Trip distance'))}</span><b>${esc(localNum(trip.distanceKm.toFixed(2)))} km</b></div>
-    <div class="row"><span>${esc(tr('Gesamtkilometer', 'Total distance'))}</span><b>${esc(fmtKm(total.distanceKm))}</b></div>
-    ${typeof l.battery === 'number' ? gearRangeList(l.battery, l.gear) : ''}
-    <button class="link" data-act="reset">${esc(tr('Tageskilometer zurücksetzen', 'Reset trip distance'))}</button>
-  </div>`;
-}
-
-function parkingCard() {
-  const p = state.parking;
-  if (!p) return '';
-  const url = `https://maps.apple.com/?ll=${p.lat},${p.lon}&q=eBike`;
-  return `<div class="card">
-    <div class="row"><b>🅿️ ${esc(tr('Rad zuletzt abgestellt', 'Bike last parked'))}</b>
-      <button class="x" data-act="forget-parking" aria-label="${esc(tr('Parkplatz vergessen', 'Forget parking spot'))}">✕</button></div>
-    <div class="faint">${esc(stamp(p.at))}</div>
-    <a class="link" href="${esc(url)}" target="_blank" rel="noopener">🗺️ ${esc(tr('In Karte öffnen', 'Open in map'))}</a>
-  </div>`;
 }
 
 const FLAG_DE = '<svg viewBox="0 0 42 28" width="42" height="28"><rect width="42" height="9.4" fill="#000"/><rect y="9.3" width="42" height="9.4" fill="#DD0000"/><rect y="18.6" width="42" height="9.4" fill="#FFCE00"/></svg>';
@@ -718,8 +462,6 @@ function connectView() {
   const busy = state.link === 'connecting' || state.reconnecting;
   const supported = !!navigator.bluetooth;
   return `
-    ${state.last ? lastCard() : ''}
-    ${parkingCard()}
     ${busy
       ? `<div class="center busy"><span class="spin"></span> ${esc(state.reconnecting ? tr('Suche nach dem Rad …', 'Searching for the bike …') : tr('Verbinde mit dem Rad …', 'Connecting to the bike …'))}</div>`
       : `<button class="btn primary" data-act="connect" ${supported ? '' : 'disabled'}>${esc(tr('Rad suchen', 'Find bike'))}</button>
@@ -736,13 +478,8 @@ function liveView() {
     return `<div class="center wait"><span class="spin big"></span><div>${esc(tr('Warte auf Daten vom Rad …', 'Waiting for data from the bike …'))}</div>
       <button class="btn" data-act="disconnect">${esc(tr('Trennen', 'Disconnect'))}</button></div>`;
   }
-  const speed = d.speedKmh === null ? '–' : localNum(d.speedKmh.toFixed(1)) + ' km/h';
-  const gearRange = d.gear !== null && d.battery !== null ? gearStats.rangeKm(d.gear, d.battery) : null;
-  const shown = gearRange ?? rangeKm;
-  const rangeLabel = gearRange !== null && GEAR_NAMES[d.gear]
-    ? `${tr('Reichweite', 'Range')} (${GEAR_NAMES[d.gear]})`
-    : tr('Reichweite', 'Range');
   const pct = d.battery === null ? 0 : d.battery;
+  // Grün über 50 %, Orange bis 21 %, ab 20 % abwärts Rot.
   const barColor = pct > 50 ? '#69f0ae' : pct > 20 ? '#ffb74d' : '#ff5252';
   const gearLabel = { 0: tr('Unterstützung aus', 'Assist off'), 1: 'Eco', 2: 'Normal', 3: 'Sport' }[d.gear] ?? tr('Unbekannt', 'Unknown');
   const canSend = !!writeChar && state.pendingGear === null;
@@ -751,24 +488,12 @@ function liveView() {
       ? `<button class="gbtn cur" disabled>${label}</button>`
       : `<button class="gbtn" data-act="gear" data-gear="${g}" ${canSend ? '' : 'disabled'}>${label}</button>`))
     .join('');
-  const low = d.battery !== null && d.battery <= BatteryAlert.threshold;
   return `
-    <div class="center title">${esc(bikeTitle())} <button class="x" data-act="rename" aria-label="${esc(tr('Umbenennen', 'Rename'))}">✎</button></div>
-    ${low ? `<div class="alert">🔋 ${esc(d.battery === null ? tr('Akku niedrig', 'Battery low') : tr(`Akku niedrig: nur noch ${d.battery} %`, `Battery low: only ${d.battery} % left`))}</div>` : ''}
-    <div class="metrics">
-      <div><div class="small">${esc(tr('Geschwindigkeit', 'Speed'))}</div><b>${esc(speed)}</b></div>
-      <div><div class="small">${esc(tr('Fahrzeit', 'Ride time'))}</div><b>${esc(formatDuration(trip.movingMs))}</b></div>
-      <div><div class="small">${esc(tr('Tageskilometer', 'Trip distance'))}</div><b>${esc(localNum(trip.distanceKm.toFixed(2)))} km</b></div>
-    </div>
     <div class="dial"><div class="sym">${esc(gearSymbol(d.gear))}</div><div class="faint">${esc(gearLabel)}</div></div>
     <div class="gears">${buttons}</div>
     ${state.pendingGear !== null ? `<div class="center pending">${esc(tr('Fahrstufe wird gesetzt …', 'Setting assist level …'))}</div>` : ''}
-    <div class="center small">${esc(d.power === null ? tr('Leistung –', 'Power –') : tr(`Leistung ${d.power} W`, `Power ${d.power} W`))}</div>
     <div class="row top"><span class="small">${esc(tr('Akku', 'Battery'))}</span><b class="small">${d.battery === null ? '–' : d.battery + ' %'}</b></div>
     <div class="bar"><div style="width:${pct}%;background:${barColor}"></div></div>
-    <div class="row top"><span class="small">${esc(rangeLabel)}</span><b>${shown === null ? esc(tr('wird ermittelt …', 'being determined …')) : esc(approx(shown))}</b></div>
-    ${shown === null ? `<div class="faint small">${esc(tr('Die Schätzung erscheint nach einigen Kilometern Fahrt.', 'The estimate appears after a few kilometres of riding.'))}</div>` : ''}
-    <button class="btn outline" data-act="reset">${esc(tr('Tageskilometer zurücksetzen', 'Reset trip distance'))}</button>
     <button class="btn plain" data-act="disconnect">${esc(tr('Trennen', 'Disconnect'))}</button>
     ${state.lockOn ? '' : `<div class="faint small center">${esc(tr('Hinweis: Der Bildschirm kann ausgehen. Dann trennt iOS die Verbindung.', 'Note: the screen may turn off. iOS then drops the connection.'))}</div>`}`;
 }
@@ -849,35 +574,11 @@ document.addEventListener('toggle', (e) => {
 $app.addEventListener('click', async (e) => {
   const el = e.target.closest('[data-act]');
   if (!el) return;
-  unlockAudio();
   switch (el.dataset.act) {
     case 'connect': await connect(false); break;
     case 'connect-all': await connect(true); break;
     case 'disconnect': await disconnect(); break;
     case 'gear': await setGear(Number(el.dataset.gear)); break;
-    case 'reset':
-      if (confirm(tr('Tageskilometer und Fahrzeit werden auf 0 gesetzt.', 'Trip distance and ride time will be set to 0.'))) {
-        trip.reset();
-        store.set('trip_km', 0);
-        store.set('trip_ms', 0);
-        log('Tageskilometer auf 0 gesetzt.');
-        scheduleRender();
-      }
-      break;
-    case 'forget-parking':
-      state.parking = null;
-      store.set('parking', null);
-      scheduleRender();
-      break;
-    case 'rename': {
-      const n = prompt(tr('Name des Rads (leer = Standardname)', 'Bike name (empty = default name)'), state.displayName);
-      if (n !== null) {
-        state.displayName = n.slice(0, 30);
-        store.set('bike_name', state.displayName.trim() ? state.displayName.trim() : null);
-        scheduleRender();
-      }
-      break;
-    }
     case 'lang-de':
     case 'lang-en':
       english = el.dataset.act === 'lang-en';
@@ -908,6 +609,6 @@ function alertBox(text) {
 }
 
 // Für Tests von außen (nur Lesen).
-window.__ebike = { state, trip, total, gearStats, maskedBikeName };
+window.__ebike = { state };
 
 render();
